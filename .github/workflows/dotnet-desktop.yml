@@ -104,14 +104,37 @@ jobs:
     #     Configuration: ${{ matrix.configuration }}
     - name: Publish output
       run: dotnet publish DupFinder/DupFinder.csproj -c Release -o publish
+    - name: Zip publish folder
+      run: Compress-Archive -Path publish\* -DestinationPath DupFinder.zip
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: DupFinder.zip
+        asset_name: DupFinder.zip
+        asset_content_type: application/zip
 
     # Remove the pfx
     # - name: Remove the pfx
     #   run: Remove-Item -path $env:Wap_Project_Directory\GitHubActionsWorkflow.pfx
 
     # Upload the MSIX package: https://github.com/marketplace/actions/upload-a-build-artifact
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: DupFinder_Build
-        path: publish
+    # - name: Upload build artifacts
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: DupFinder_Build
+    #     path: publish
