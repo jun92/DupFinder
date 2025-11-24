@@ -56,24 +56,41 @@ namespace DupFinder
 
             var folderA = FolderAPathTextBox.Text.Trim();
             var folderB = FolderBPathTextBox.Text.Trim();
+            var hasA = Directory.Exists(folderA);
+            var hasB = Directory.Exists(folderB);
 
-            if (!Directory.Exists(folderA) || !Directory.Exists(folderB))
+            if (!hasA && !hasB)
             {
-                System.Windows.MessageBox.Show("존재하는 두 폴더를 모두 선택해 주세요.", "경고", MessageBoxButton.OK, MessageBoxImage.Warning);
+                System.Windows.MessageBox.Show("존재하는 폴더를 하나 이상 선택해 주세요.", "경고", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
+            var singleFolderMode = hasA ^ hasB;
+            var targetSingleFolder = hasA ? folderA : folderB;
+
             _isScanning = true;
             ToggleUiDuringScan(isScanning: true);
-            StatusTag.Text = "스캔 중...";
-            SummaryTextBlock.Text = "해시 계산 중입니다. 파일 수에 따라 시간이 걸릴 수 있습니다.";
+            StatusTag.Text = singleFolderMode ? "스캔 중... (단일 폴더)" : "스캔 중...";
+            SummaryTextBlock.Text = singleFolderMode
+                ? "단일 폴더 내에서 중복 파일을 찾고 있습니다."
+                : "해시 계산 중입니다. 파일 수에 따라 시간이 걸릴 수 있습니다.";
             CurrentScanText.Text = "스캔 준비 중...";
             Results.Clear();
 
             try
             {
                 var progress = new Progress<string>(UpdateCurrentScan);
-                var results = await Task.Run(() => ScanForDuplicates(folderA, folderB, progress));
+                List<DuplicateResult> results;
+
+                if (singleFolderMode)
+                {
+                    results = await Task.Run(() => ScanForDuplicatesWithinFolder(targetSingleFolder, progress));
+                }
+                else
+                {
+                    results = await Task.Run(() => ScanForDuplicates(folderA, folderB, progress));
+                }
+
                 Results.Clear();
                 foreach (var item in results)
                 {
@@ -83,12 +100,16 @@ namespace DupFinder
                 if (Results.Count == 0)
                 {
                     StatusTag.Text = "중복 없음";
-                    SummaryTextBlock.Text = "해시가 같은 파일을 찾지 못했습니다.";
+                    SummaryTextBlock.Text = singleFolderMode
+                        ? "폴더 내에서 중복 파일을 찾지 못했습니다."
+                        : "해시가 같은 파일을 찾지 못했습니다.";
                 }
                 else
                 {
                     StatusTag.Text = $"중복 {Results.Count}건";
-                    SummaryTextBlock.Text = "유지할 파일을 선택하세요.";
+                    SummaryTextBlock.Text = singleFolderMode
+                        ? "같은 해시의 파일 쌍을 찾았습니다. 유지할 파일을 선택하세요."
+                        : "유지할 파일을 선택하세요.";
                 }
             }
             catch (Exception ex)
@@ -255,6 +276,53 @@ namespace DupFinder
             }
 
             return duplicates.OrderBy(d => d.Hash).ToList();
+        }
+
+        private static List<DuplicateResult> ScanForDuplicatesWithinFolder(string folder, IProgress<string>? progress = null)
+        {
+            var groups = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var path in EnumerateFilesSafely(folder))
+            {
+                progress?.Report($"폴더 스캔: {path}");
+                var hash = ComputeSha256(path);
+                if (hash is null)
+                {
+                    continue;
+                }
+
+                var size = GetFileSize(path);
+                if (!groups.TryGetValue(hash, out var list))
+                {
+                    list = new List<FileEntry>();
+                    groups[hash] = list;
+                }
+
+                list.Add(new FileEntry(path, size));
+            }
+
+            var results = new List<DuplicateResult>();
+            foreach (var kvp in groups)
+            {
+                var entries = kvp.Value;
+                if (entries.Count <= 1)
+                {
+                    continue;
+                }
+
+                var anchor = entries[0];
+                for (int i = 1; i < entries.Count; i++)
+                {
+                    var dup = entries[i];
+                    results.Add(new DuplicateResult(
+                        kvp.Key,
+                        anchor.Path,
+                        dup.Path,
+                        Math.Max(anchor.Size, dup.Size)));
+                }
+            }
+
+            return results.OrderBy(r => r.Hash).ToList();
         }
 
         private static IEnumerable<string> EnumerateFilesSafely(string root)
