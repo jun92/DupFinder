@@ -237,41 +237,134 @@ namespace DupFinder
             CurrentScanText.Text = message;
         }
 
+        private static bool IsBinaryFile(string path)
+        {
+            try
+            {
+                using var stream = File.OpenRead(path);
+                byte[] buffer = new byte[1024];
+                int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                
+                for (int i = 0; i < bytesRead; i++)
+                {
+                    if (buffer[i] == 0) // NULL 바이트가 있으면 바이너리 파일
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            catch
+            {
+                return true; // 에러 발생 시 바이너리로 취급하여 크기 비교 진행
+            }
+        }
+
         private static List<DuplicateResult> ScanForDuplicates(string folderA, string folderB, IProgress<string>? progress = null)
         {
             var duplicates = new List<DuplicateResult>();
-            var folderAHashes = new Dictionary<string, FileEntry>(StringComparer.OrdinalIgnoreCase);
+            var textHashesA = new Dictionary<string, FileEntry>(StringComparer.OrdinalIgnoreCase);
+            var binarySizeToPathsA = new Dictionary<long, List<string>>();
 
+            // 1단계: 폴더 A 스캔
             foreach (var path in EnumerateFilesSafely(folderA))
             {
-                progress?.Report($"폴더 A 스캔: {path}");
-                var hash = ComputeSha256(path);
-                if (hash is null)
+                if (IsBinaryFile(path))
                 {
-                    continue;
+                    progress?.Report($"폴더 A 바이너리 스캔 (크기 수집): {path}");
+                    var size = GetFileSize(path);
+                    if (!binarySizeToPathsA.TryGetValue(size, out var list))
+                    {
+                        list = new List<string>();
+                        binarySizeToPathsA[size] = list;
+                    }
+                    list.Add(path);
                 }
-
-                var size = GetFileSize(path);
-                folderAHashes[hash] = new FileEntry(path, size);
+                else
+                {
+                    progress?.Report($"폴더 A 텍스트 스캔 (즉시 해시 계산): {path}");
+                    var hash = ComputeSha256(path);
+                    if (hash is null)
+                    {
+                        continue;
+                    }
+                    var size = GetFileSize(path);
+                    textHashesA[hash] = new FileEntry(path, size);
+                }
             }
 
-            foreach (var path in EnumerateFilesSafely(folderB))
-            {
-                progress?.Report($"폴더 B 스캔: {path}");
-                var hash = ComputeSha256(path);
-                if (hash is null)
-                {
-                    continue;
-                }
+            // 폴더 A 바이너리 파일의 계산된 해시 캐싱용
+            var computedBinaryHashesA = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-                if (folderAHashes.TryGetValue(hash, out var entryA))
+            // 2단계: 폴더 B 스캔 및 비교
+            foreach (var pathB in EnumerateFilesSafely(folderB))
+            {
+                if (IsBinaryFile(pathB))
                 {
-                    var size = GetFileSize(path);
-                    duplicates.Add(new DuplicateResult(
-                        hash,
-                        entryA.Path,
-                        path,
-                        Math.Max(entryA.Size, size)));
+                    progress?.Report($"폴더 B 바이너리 스캔: {pathB}");
+                    var size = GetFileSize(pathB);
+
+                    if (binarySizeToPathsA.TryGetValue(size, out var pathsA))
+                    {
+                        string? hashB = null;
+
+                        foreach (var pathA in pathsA)
+                        {
+                            if (!computedBinaryHashesA.TryGetValue(pathA, out var hashA))
+                            {
+                                progress?.Report($"바이너리 해시 계산 (A): {pathA}");
+                                hashA = ComputeSha256(pathA);
+                                if (hashA != null)
+                                {
+                                    computedBinaryHashesA[pathA] = hashA;
+                                }
+                            }
+
+                            if (hashA == null)
+                            {
+                                continue;
+                            }
+
+                            if (hashB == null)
+                            {
+                                progress?.Report($"바이너리 해시 계산 (B): {pathB}");
+                                hashB = ComputeSha256(pathB);
+                            }
+
+                            if (hashB == null)
+                            {
+                                break;
+                            }
+
+                            if (hashA.Equals(hashB, StringComparison.OrdinalIgnoreCase))
+                            {
+                                duplicates.Add(new DuplicateResult(
+                                    hashB,
+                                    pathA,
+                                    pathB,
+                                    size));
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    progress?.Report($"폴더 B 텍스트 스캔 (즉시 해시 계산): {pathB}");
+                    var hashB = ComputeSha256(pathB);
+                    if (hashB is null)
+                    {
+                        continue;
+                    }
+
+                    if (textHashesA.TryGetValue(hashB, out var entryA))
+                    {
+                        var size = GetFileSize(pathB);
+                        duplicates.Add(new DuplicateResult(
+                            hashB,
+                            entryA.Path,
+                            pathB,
+                            Math.Max(entryA.Size, size)));
+                    }
                 }
             }
 
@@ -280,29 +373,72 @@ namespace DupFinder
 
         private static List<DuplicateResult> ScanForDuplicatesWithinFolder(string folder, IProgress<string>? progress = null)
         {
-            var groups = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
+            var hashGroups = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
+            var sizeToPathsBinary = new Dictionary<long, List<string>>();
 
+            // 1단계: 전체 파일을 순회하며 텍스트는 즉시 해시 계산, 바이너리는 크기별로 모음
             foreach (var path in EnumerateFilesSafely(folder))
             {
-                progress?.Report($"폴더 스캔: {path}");
-                var hash = ComputeSha256(path);
-                if (hash is null)
+                if (IsBinaryFile(path))
+                {
+                    progress?.Report($"폴더 스캔 (바이너리 크기 수집): {path}");
+                    var size = GetFileSize(path);
+                    if (!sizeToPathsBinary.TryGetValue(size, out var list))
+                    {
+                        list = new List<string>();
+                        sizeToPathsBinary[size] = list;
+                    }
+                    list.Add(path);
+                }
+                else
+                {
+                    progress?.Report($"텍스트 파일 스캔 (즉시 해시 계산): {path}");
+                    var hash = ComputeSha256(path);
+                    if (hash is null)
+                    {
+                        continue;
+                    }
+                    var size = GetFileSize(path);
+                    if (!hashGroups.TryGetValue(hash, out var list))
+                    {
+                        list = new List<FileEntry>();
+                        hashGroups[hash] = list;
+                    }
+                    list.Add(new FileEntry(path, size));
+                }
+            }
+
+            // 2단계: 동일 크기의 바이너리 파일이 2개 이상 존재하는 경우에만 해시 계산 후 hashGroups에 병합
+            foreach (var kvp in sizeToPathsBinary)
+            {
+                var size = kvp.Key;
+                var paths = kvp.Value;
+                if (paths.Count <= 1)
                 {
                     continue;
                 }
 
-                var size = GetFileSize(path);
-                if (!groups.TryGetValue(hash, out var list))
+                foreach (var path in paths)
                 {
-                    list = new List<FileEntry>();
-                    groups[hash] = list;
-                }
+                    progress?.Report($"바이너리 해시 계산: {path}");
+                    var hash = ComputeSha256(path);
+                    if (hash is null)
+                    {
+                        continue;
+                    }
 
-                list.Add(new FileEntry(path, size));
+                    if (!hashGroups.TryGetValue(hash, out var list))
+                    {
+                        list = new List<FileEntry>();
+                        hashGroups[hash] = list;
+                    }
+                    list.Add(new FileEntry(path, size));
+                }
             }
 
+            // 3단계: 중복 결과 리스트 구성
             var results = new List<DuplicateResult>();
-            foreach (var kvp in groups)
+            foreach (var kvp in hashGroups)
             {
                 var entries = kvp.Value;
                 if (entries.Count <= 1)
